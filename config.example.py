@@ -79,6 +79,6 @@ ANNOUNCEMENT = {
     'show_button': False,  # 是否在主菜单中展示公告按钮
     'button_text': '📢 查看公告',
     'title': '📢 系统公告',
-    'content': f'欢迎使用流影社 {EMBY_DISPLAY_NAME}！',
+    'content': f'欢迎使用 {EMBY_DISPLAY_NAME}！',
     'updated': '',
 }
