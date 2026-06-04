@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.pyo
+
+config.py
+emby_passwords.json
+server_ips.txt
+.env
+*.log
+
+backup/
+backups/
+*.bak
+*.tmp
+
+To

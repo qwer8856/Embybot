@@ -1,0 +1,5 @@
+requests
+PyMySQL
+python-telegram-bot
+bcrypt
+psutil
