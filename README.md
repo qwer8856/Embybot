@@ -313,6 +313,56 @@ SUBSCRIPTION_URLS = [
 SUBSCRIPTION_URLS = []
 ```
 
+### 6.1 检测订阅节点落地 IP
+
+如果你需要检测节点真正访问外网时的落地 IP，不能只解析订阅里的入口域名，必须实际连接节点后访问查 IP 接口。
+
+先在 Linux 服务器安装 `sing-box`，确认可用：
+
+```bash
+sing-box version
+curl --version
+```
+
+然后在 `config.py` 中配置：
+
+```python
+SUBSCRIPTION_URLS = [
+    "https://your-xboard-domain.com/s/your_subscription_token",
+]
+```
+
+再直接运行：
+
+```bash
+python3 detect_exit_ips.py
+```
+
+脚本会自动解析订阅中的 `ss://`、`vmess://`、`vless://` 节点，逐个启动临时 `sing-box` 配置检测落地 IP，并输出：
+
+```text
+exit_ips.txt
+exit_ip_results.json
+```
+
+常用参数：
+
+```bash
+# 只测试前 3 个节点
+python3 detect_exit_ips.py --limit 3
+
+# 每个节点最多检测 20 秒
+python3 detect_exit_ips.py --timeout 20
+
+# 使用自己的查 IP 接口
+python3 detect_exit_ips.py --ip-url "https://api.ipify.org"
+
+# 临时指定订阅链接，不读取 config.py
+python3 detect_exit_ips.py "https://your-xboard-domain.com/s/your_subscription_token"
+```
+
+注意：订阅链接包含 token，测试后建议在面板重置订阅链接。落地 IP 也可能因为机场负载均衡而变化。
+
 ### 7. 公告配置
 
 ```python
