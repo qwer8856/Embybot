@@ -9,7 +9,7 @@ from telegram import Bot
 from telegram.ext import Application
 from xboard_api import get_active_subscriptions, get_all_users
 from emby_api import get_emby_users, disable_emby_user, enable_emby_user, apply_bot_default_user_policy, get_emby_servers
-from telegram_bot import setup_bot, run_blocking, load_password_store, get_stored_emby_account_entries
+from telegram_bot import setup_bot, configure_bot_commands, run_blocking, load_password_store, get_stored_emby_account_entries
 
 CHECK_INTERVAL_SECONDS = getattr(config, 'CHECK_INTERVAL_SECONDS', 300)
 TELEGRAM_BOT_TOKEN = getattr(config, 'TELEGRAM_BOT_TOKEN', '')
@@ -184,6 +184,8 @@ async def main() -> None:
 
     # 使用 async with 语句来确保 application 被正确地启动和关闭
     async with application:
+        await configure_bot_commands(application)
+
         # 启动后台同步任务
         sync_task = asyncio.create_task(sync_emby_users(application))
         logger.info("后台同步任务已创建。")

@@ -13,7 +13,7 @@ import warnings
 import stat
 import threading
 import config
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import Application, BaseUpdateProcessor, CommandHandler, ConversationHandler, MessageHandler, filters, CallbackContext, CallbackQueryHandler
 from telegram.warnings import PTBUserWarning
@@ -115,6 +115,18 @@ async def safe_answer_callback_query(query):
         await query.answer()
     except (TimedOut, NetworkError, BadRequest) as exc:
         logger.warning("回答按钮回调失败，继续处理后续逻辑: %s", exc)
+
+async def configure_bot_commands(application):
+    """Overwrite Telegram's command menu so legacy commands disappear from clients."""
+    commands = [
+        BotCommand("start", "开始使用"),
+        BotCommand("bind", "绑定账号"),
+        BotCommand("unbind", "解除绑定"),
+        BotCommand("status", "查看绑定状态"),
+        BotCommand("help", "查看帮助"),
+    ]
+    await application.bot.set_my_commands(commands)
+    logger.info("已更新 Telegram Bot 命令菜单: %s", ", ".join(f"/{command.command}" for command in commands))
 
 # 用于保存用户设置的 Emby 密码
 PASSWORD_STORE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'emby_passwords.json')
@@ -278,6 +290,14 @@ def _format_server_label(server):
 def _escape_html(value):
     return html.escape(str(value), quote=False)
 
+def _log_user_action(action, status, **details):
+    detail_text = " ".join(
+        f"{key}={value}"
+        for key, value in details.items()
+        if value not in (None, '')
+    )
+    logger.info("action=%s status=%s %s", action, status, detail_text)
+
 def _format_number(value, digits=2):
     try:
         return f"{float(value):.{digits}f}"
@@ -289,6 +309,28 @@ def _to_float(value, default=0):
         return float(value)
     except (TypeError, ValueError):
         return default
+
+def _has_value(value):
+    return value not in (None, '', 0, '0')
+
+def _subscription_access_status(xboard_user):
+    """Return whether the Xboard subscription can currently open an Emby account."""
+    if not isinstance(xboard_user, dict):
+        return False, f"请先使用 /bind 命令绑定您的 {XBOARD_DISPLAY_NAME} 账户。"
+
+    if not _has_value(xboard_user.get('plan_id')):
+        return False, f"您没有有效的订阅，无法创建 {EMBY_DISPLAY_NAME} 账户。"
+
+    expired_at = _to_float(xboard_user.get('expired_at'), None)
+    if expired_at not in (None, 0) and expired_at < time.time():
+        return False, f"您的订阅已过期，无法创建 {EMBY_DISPLAY_NAME} 账户。"
+
+    transfer_enable = _to_float(xboard_user.get('transfer_enable'))
+    used_traffic = _to_float(xboard_user.get('u')) + _to_float(xboard_user.get('d'))
+    if transfer_enable <= used_traffic:
+        return False, f"您的订阅流量已用尽，无法创建 {EMBY_DISPLAY_NAME} 账户。"
+
+    return True, ""
 
 def _format_subscription_progress(used_gb, total_gb, width=12):
     used = _to_float(used_gb)
@@ -305,10 +347,12 @@ def _format_subscription_progress(used_gb, total_gb, width=12):
 def _format_subscription_message(details):
     used_gb = _to_float(details.get('uploaded_gb')) + _to_float(details.get('downloaded_gb'))
     total_gb = _to_float(details.get('total_gb'))
+    remaining_gb = max(total_gb - used_gb, 0)
     progress = _format_subscription_progress(used_gb, total_gb)
 
     usage_lines = [
         f"<b>已用流量</b>  {_format_number(used_gb)} GB",
+        f"<b>剩余流量</b>  {_format_number(remaining_gb)} GB",
         f"<b>总流量</b>    {_format_number(total_gb)} GB",
     ]
     if progress:
@@ -549,20 +593,59 @@ def delete_all_bot_managed_emby_users():
         if not server:
             result['failed'] += 1
             result['failures'].append(f"{label}: 未找到服务器配置")
+            _log_user_action(
+                'admin_delete_all_bot_emby_item',
+                'failed',
+                email=entry.get('source_email'),
+                telegram_id=entry.get('telegram_id'),
+                server_key=entry.get('server_key'),
+                emby_username=entry.get('emby_username'),
+                reason='server_not_found',
+            )
             continue
 
         emby_user = get_emby_user_by_name(entry['emby_username'], server_key=server['key'])
         if not emby_user:
             result['not_found'] += 1
             removable_entries.append(entry)
+            _log_user_action(
+                'admin_delete_all_bot_emby_item',
+                'not_found',
+                email=entry.get('source_email'),
+                telegram_id=entry.get('telegram_id'),
+                server=server['display_name'],
+                server_key=server['key'],
+                emby_username=entry.get('emby_username'),
+            )
             continue
 
         if delete_emby_user(emby_user['Id'], server['key']):
             result['deleted'] += 1
             removable_entries.append(entry)
+            _log_user_action(
+                'admin_delete_all_bot_emby_item',
+                'deleted',
+                email=entry.get('source_email'),
+                telegram_id=entry.get('telegram_id'),
+                server=server['display_name'],
+                server_key=server['key'],
+                emby_username=entry.get('emby_username'),
+                emby_user_id=emby_user.get('Id'),
+            )
         else:
             result['failed'] += 1
             result['failures'].append(f"{entry['emby_username']}@{server['display_name']}: 删除失败")
+            _log_user_action(
+                'admin_delete_all_bot_emby_item',
+                'failed',
+                email=entry.get('source_email'),
+                telegram_id=entry.get('telegram_id'),
+                server=server['display_name'],
+                server_key=server['key'],
+                emby_username=entry.get('emby_username'),
+                emby_user_id=emby_user.get('Id'),
+                reason='delete_failed',
+            )
 
     result['removed_records'] = _remove_bot_managed_entries_from_store(removable_entries)
     return result
@@ -570,64 +653,59 @@ def delete_all_bot_managed_emby_users():
 
 def delete_user_emby_accounts_for_unbind(email, telegram_id):
     """删除用户解绑时关联的所有真实存在的 Emby 账号。"""
+    checked = resolve_emby_accounts_checked(email, telegram_id=telegram_id)
     result = {
-        'planned': 0,
+        'planned': len(checked['accounts']),
         'deleted': 0,
-        'failed': 0,
-        'failures': [],
+        'failed': len(checked['failures']),
+        'failures': checked['failures'][:],
     }
-    entries = get_stored_emby_account_entries(email, telegram_id)
-    emby_users_cache = {}
-    seen = set()
 
-    def get_user_map(server):
-        server_key = server['key']
-        if server_key not in emby_users_cache:
-            users = get_emby_users(server_key)
-            if not isinstance(users, list):
-                emby_users_cache[server_key] = None
-                result['failed'] += 1
-                result['failures'].append(f"{server['display_name']}: 无法获取用户列表")
-                return None
+    if result['failed']:
+        _log_user_action(
+            'unbind_delete_emby_accounts',
+            'blocked',
+            email=email,
+            telegram_id=telegram_id,
+            planned=result['planned'],
+            failed=result['failed'],
+            reason='precheck_failed',
+        )
+        return result
 
-            emby_users_cache[server_key] = {
-                user.get('Name', '').lower(): user
-                for user in users
-                if isinstance(user, dict) and user.get('Name')
-            }
-
-        return emby_users_cache[server_key]
-
-    for entry in entries:
-        server = get_emby_server(entry['server_key'])
-        if not server:
-            result['failed'] += 1
-            result['failures'].append(f"{entry['emby_username']}@{entry['server_key']}: 未找到服务器配置")
-            continue
-
-        user_map = get_user_map(server)
-        if user_map is None:
-            continue
-
-        emby_username = entry['emby_username']
-        emby_user = user_map.get(emby_username.strip().lower())
-        if not emby_user:
-            continue
-
-        unique_key = (server['key'], emby_user.get('Id') or emby_username.strip().lower())
-        if unique_key in seen:
-            continue
-        seen.add(unique_key)
-
-        result['planned'] += 1
+    for account in checked['accounts']:
+        server = account['server']
+        emby_user = account['emby_user']
+        emby_username = account['emby_username']
         label = f"{emby_username}@{server['display_name']}"
 
         if delete_emby_user(emby_user['Id'], server['key']):
             result['deleted'] += 1
-            delete_stored_emby_password(entry['source_email'], server['key'])
+            delete_stored_emby_password(account['source_email'], server['key'])
+            _log_user_action(
+                'unbind_delete_emby_item',
+                'deleted',
+                email=account.get('source_email'),
+                telegram_id=telegram_id,
+                server=server['display_name'],
+                server_key=server['key'],
+                emby_username=emby_username,
+                emby_user_id=emby_user.get('Id'),
+            )
         else:
             result['failed'] += 1
             result['failures'].append(label)
+            _log_user_action(
+                'unbind_delete_emby_item',
+                'failed',
+                email=account.get('source_email'),
+                telegram_id=telegram_id,
+                server=server['display_name'],
+                server_key=server['key'],
+                emby_username=emby_username,
+                emby_user_id=emby_user.get('Id'),
+                reason='delete_failed',
+            )
 
     return result
 
@@ -682,6 +760,14 @@ def main_menu_keyboard(is_admin=False):
 
 def home_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("返回主页", callback_data='main_menu')]])
+
+def unbind_confirm_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("确认解绑并删除", callback_data='confirm_unbind_yes'),
+            InlineKeyboardButton("取消", callback_data='confirm_unbind_no'),
+        ]
+    ])
 
 def admin_menu_keyboard():
     keyboard = [
@@ -782,6 +868,74 @@ def resolve_emby_account(email, telegram_id=None, server_key=None):
     """解析当前用户真实存在的一个 Emby 账号，兼容旧调用。"""
     accounts = resolve_emby_accounts(email, telegram_id=telegram_id, server_key=server_key)
     return accounts[0] if accounts else None
+
+def resolve_emby_accounts_checked(email, telegram_id=None, server_key=None):
+    """解析 Emby 账号，并区分账号不存在和 Emby API 获取失败。"""
+    accounts = []
+    failures = []
+    failed_server_keys = set()
+    seen = set()
+    emby_users_cache = {}
+
+    def add_failure(server_key_value, label):
+        if server_key_value in failed_server_keys:
+            return
+        failed_server_keys.add(server_key_value)
+        failures.append(label)
+
+    def find_emby_user(username, server):
+        target_server_key = server['key']
+        if target_server_key not in emby_users_cache:
+            users = get_emby_users(target_server_key)
+            if not isinstance(users, list):
+                emby_users_cache[target_server_key] = None
+                add_failure(target_server_key, f"{server['display_name']}: 无法获取用户列表")
+                return None
+
+            emby_users_cache[target_server_key] = {
+                user.get('Name', '').lower(): user
+                for user in users
+                if isinstance(user, dict) and user.get('Name')
+            }
+
+        user_map = emby_users_cache[target_server_key]
+        if user_map is None:
+            return None
+
+        return user_map.get(username.strip().lower())
+
+    for entry in get_stored_emby_account_entries(email, telegram_id):
+        if server_key and entry['server_key'] != server_key:
+            continue
+
+        server = get_emby_server(entry['server_key'])
+        if not server:
+            add_failure(entry['server_key'], f"{entry['emby_username']}@{entry['server_key']}: 未找到服务器配置")
+            continue
+
+        emby_user = find_emby_user(entry['emby_username'], server)
+        if not emby_user:
+            continue
+
+        unique_key = (server['key'], emby_user.get('Id') or entry['emby_username'].lower())
+        if unique_key in seen:
+            continue
+        seen.add(unique_key)
+
+        accounts.append({
+            'source_email': entry['source_email'],
+            'server_key': server['key'],
+            'server': server,
+            'emby_username': entry['emby_username'],
+            'password': entry.get('password'),
+            'telegram_id': telegram_id,
+            'emby_user': emby_user,
+        })
+
+    return {
+        'accounts': accounts,
+        'failures': failures,
+    }
 
 def generate_main_menu_message(user, xboard_user, is_admin=False):
     """生成主菜单的欢迎消息"""
@@ -916,7 +1070,7 @@ async def process_password(update: Update, context: CallbackContext) -> int:
             return ConversationHandler.END
 
 async def unbind_command(update: Update, context: CallbackContext) -> None:
-    """处理 /unbind 命令"""
+    """处理 /unbind 命令，先要求用户确认。"""
     user_id = update.effective_user.id
     xboard_user = await run_blocking(get_user_by_telegram_id, user_id)
 
@@ -925,28 +1079,107 @@ async def unbind_command(update: Update, context: CallbackContext) -> None:
         return
 
     email = xboard_user.get('email')
+    checked = await run_blocking(resolve_emby_accounts_checked, email, user_id)
+    if checked['failures']:
+        failures = "\n".join(f"- {_escape_html(item)}" for item in checked['failures'][:10])
+        await update.message.reply_text(
+            f"暂时无法确认您的 {EMBY_DISPLAY_NAME} 账号，已取消解绑。\n\n"
+            f"{failures}\n\n"
+            "请稍后重试，或联系管理员处理。",
+            parse_mode='HTML'
+        )
+        return
+
+    account_lines = [
+        f"- {_escape_html(_format_server_label(account['server']))}: <code>{_escape_html(account['emby_username'])}</code>"
+        for account in checked['accounts']
+    ]
+    account_summary = "\n".join(account_lines) if account_lines else f"未检测到需要删除的 {EMBY_DISPLAY_NAME} 账号。"
+
+    await update.message.reply_text(
+        "<b>确认解绑？</b>\n\n"
+        f"当前绑定邮箱：<code>{_escape_html(email)}</code>\n"
+        f"将删除 {len(checked['accounts'])} 个 {EMBY_DISPLAY_NAME} 账号：\n"
+        f"{account_summary}\n\n"
+        "确认后会先删除上述账号，再解除 Telegram 绑定。",
+        parse_mode='HTML',
+        reply_markup=unbind_confirm_keyboard()
+    )
+
+
+async def process_unbind_confirmation(update: Update, context: CallbackContext) -> None:
+    """处理 /unbind 的二次确认。"""
+    query = update.callback_query
+    await safe_answer_callback_query(query)
+    user_id = query.from_user.id
+
+    if query.data == 'confirm_unbind_no':
+        _log_user_action('unbind_confirm', 'cancelled', telegram_id=user_id)
+        await query.edit_message_text("解绑操作已取消。", reply_markup=home_keyboard())
+        return
+
+    xboard_user = await run_blocking(get_user_by_telegram_id, user_id)
+    if not xboard_user:
+        await query.edit_message_text(f"您的 Telegram 账户尚未绑定任何 {XBOARD_DISPLAY_NAME} 账户。", reply_markup=home_keyboard())
+        return
+
+    email = xboard_user.get('email')
+    _log_user_action('unbind_confirm', 'accepted', email=email, telegram_id=user_id)
+    await query.edit_message_text(
+        f"正在删除 {EMBY_DISPLAY_NAME} 账号并解绑，请稍候...",
+        reply_markup=None
+    )
     delete_result = await run_blocking(delete_user_emby_accounts_for_unbind, email, user_id)
     if delete_result['failed']:
         failures = "\n".join(f"- {item}" for item in delete_result['failures'][:10])
-        await update.message.reply_text(
+        _log_user_action(
+            'unbind',
+            'failed',
+            email=email,
+            telegram_id=user_id,
+            planned=delete_result['planned'],
+            deleted=delete_result['deleted'],
+            failed=delete_result['failed'],
+        )
+        await query.edit_message_text(
             f"解绑前删除 {EMBY_DISPLAY_NAME} 账号失败，已取消解绑。\n\n"
             f"删除成功: {delete_result['deleted']} 个\n"
             f"删除失败: {delete_result['failed']} 个\n"
             f"{failures}\n\n"
-            "请联系管理员处理后再重试。"
+            "请联系管理员处理后再重试。",
+            reply_markup=home_keyboard()
         )
         return
 
     if await run_blocking(unbind_telegram_id, user_id):
         await run_blocking(delete_stored_emby_passwords_for_identity, email, user_id)
-        await update.message.reply_text(
+        _log_user_action(
+            'unbind',
+            'success',
+            email=email,
+            telegram_id=user_id,
+            planned=delete_result['planned'],
+            deleted=delete_result['deleted'],
+        )
+        await query.edit_message_text(
             f"解绑成功！您的 Telegram 账户不再关联任何 {XBOARD_DISPLAY_NAME} 账户。\n"
             f"已同步删除 {delete_result['deleted']} 个 {EMBY_DISPLAY_NAME} 账号。\n"
-            "如需再次使用，请 /bind。"
+            "如需再次使用，请 /bind。",
+            reply_markup=home_keyboard()
         )
     else:
-        await update.message.reply_text(
-            f"解绑失败，请联系管理员。已删除 {delete_result['deleted']} 个 {EMBY_DISPLAY_NAME} 账号。"
+        _log_user_action(
+            'unbind',
+            'failed',
+            email=email,
+            telegram_id=user_id,
+            planned=delete_result['planned'],
+            deleted=delete_result['deleted'],
+            reason='xboard_unbind_failed',
+        )
+        await query.edit_message_text(
+            f"解绑失败，请联系管理员。已删除 {delete_result['deleted']} 个 {EMBY_DISPLAY_NAME} 账号。",
+            reply_markup=home_keyboard()
         )
 
 
@@ -957,8 +1190,10 @@ async def status_command(update: Update, context: CallbackContext) -> None:
 
     if xboard_user:
         email = xboard_user.get('email', 'N/A')
-        # 使用 MarkdownV2 需要对特殊字符进行转义，但这里 email 一般没有问题
-        await update.message.reply_text(f"您的 Telegram 账户已绑定到 {XBOARD_DISPLAY_NAME} 邮箱：\n`{email}`", parse_mode='MarkdownV2')
+        await update.message.reply_text(
+            f"您的 Telegram 账户已绑定到 {XBOARD_DISPLAY_NAME} 邮箱：\n<code>{_escape_html(email)}</code>",
+            parse_mode='HTML'
+        )
     else:
         await update.message.reply_text(f"您的 Telegram 账户尚未绑定任何 {XBOARD_DISPLAY_NAME} 账户。\n请使用 /bind 命令进行绑定。")
 
@@ -1167,6 +1402,15 @@ async def process_delete_confirmation(update: Update, context: CallbackContext) 
         server = get_emby_server(server_key) or get_emby_server()
 
         if not emby_user_id or not email:
+            _log_user_action(
+                'delete_emby_account',
+                'failed',
+                telegram_id=user_id,
+                email=email,
+                emby_username=emby_username,
+                server_key=server_key,
+                reason='missing_context',
+            )
             await query.edit_message_text(
                 "发生内部错误，无法找到要删除的账户信息。请重新开始。",
                 reply_markup=home_keyboard()
@@ -1176,17 +1420,41 @@ async def process_delete_confirmation(update: Update, context: CallbackContext) 
 
         if await run_blocking(delete_emby_user, emby_user_id, server['key']):
             await run_blocking(delete_stored_emby_password, email, server['key'])
+            _log_user_action(
+                'delete_emby_account',
+                'deleted',
+                email=email,
+                telegram_id=user_id,
+                server=_format_server_label(server),
+                server_key=server['key'],
+                emby_username=emby_username,
+                emby_user_id=emby_user_id,
+                is_admin=is_admin,
+            )
             await query.edit_message_text(
                 f"您的 {_format_server_label(server)} 账户 ({emby_username}) 已被成功删除。\n"
                 f'后续如需使用，请重新在菜单中选择"注册/绑定 {EMBY_DISPLAY_NAME}" 创建账户。',
                 reply_markup=home_keyboard()
             )
         else:
+            _log_user_action(
+                'delete_emby_account',
+                'failed',
+                email=email,
+                telegram_id=user_id,
+                server=_format_server_label(server),
+                server_key=server['key'],
+                emby_username=emby_username,
+                emby_user_id=emby_user_id,
+                is_admin=is_admin,
+                reason='delete_failed',
+            )
             await query.edit_message_text(
                 f"删除 {_format_server_label(server)} 账户失败，请联系管理员。",
                 reply_markup=home_keyboard()
             )
     else: # confirm_delete_no
+        _log_user_action('delete_emby_account', 'cancelled', telegram_id=user_id)
         await query.edit_message_text(
             "删除操作已取消。",
             reply_markup=home_keyboard()
@@ -1357,11 +1625,22 @@ async def button(update: Update, context: CallbackContext) -> None:
             await query.edit_message_text("抱歉，此功能仅限管理员使用。")
             return
 
+        _log_user_action('admin_delete_all_bot_emby', 'started', telegram_id=user_id)
         await query.edit_message_text(
             f"正在删除所有 Bot 记录的 {EMBY_DISPLAY_NAME} 账号，请稍候...",
             reply_markup=None
         )
         result = await run_blocking(delete_all_bot_managed_emby_users)
+        _log_user_action(
+            'admin_delete_all_bot_emby',
+            'finished',
+            telegram_id=user_id,
+            planned=result['planned'],
+            deleted=result['deleted'],
+            not_found=result['not_found'],
+            failed=result['failed'],
+            removed_records=result['removed_records'],
+        )
         message = (
             f"<b>删除完成</b>\n\n"
             f"计划处理: {result['planned']} 个\n"
@@ -1526,8 +1805,18 @@ async def button(update: Update, context: CallbackContext) -> None:
             return
 
         email = xboard_user.get('email', 'N/A')
-        emby_accounts = await run_blocking(resolve_emby_accounts, email, user_id)
+        checked = await run_blocking(resolve_emby_accounts_checked, email, user_id)
+        emby_accounts = checked['accounts']
         if not emby_accounts:
+            if checked['failures']:
+                failures = "\n".join(f"- {_escape_html(item)}" for item in checked['failures'][:10])
+                await query.edit_message_text(
+                    f"暂时无法确认您的 {EMBY_DISPLAY_NAME} 账号，请稍后重试。\n\n{failures}",
+                    parse_mode='HTML',
+                    reply_markup=home_keyboard()
+                )
+                return
+
             await query.edit_message_text(
                 f"您还没有创建 {EMBY_DISPLAY_NAME} 账户。\n请先点击 \"开通 {EMBY_DISPLAY_NAME}\" 创建账户。",
                 reply_markup=home_keyboard()
@@ -1547,6 +1836,9 @@ async def button(update: Update, context: CallbackContext) -> None:
             + "\n\n".join(server_blocks)
             + "\n\n💡 <i>点击地址可直接复制</i>"
         )
+        if checked['failures']:
+            failures = "\n".join(f"- {_escape_html(item)}" for item in checked['failures'][:10])
+            message += f"\n\n<b>部分服务器暂时无法确认</b>\n{failures}"
         await query.edit_message_text(
             text=message,
             parse_mode='HTML',
@@ -1619,9 +1911,10 @@ async def handle_bind_emby_for_server(query, context, server_key):
 
     if not emby_user:
         # 检查订阅是否有效
-        if not xboard_user.get('plan_id') or (xboard_user.get('expired_at') is not None and xboard_user.get('expired_at') < time.time()):
-             await query.edit_message_text(f"您没有有效的订阅，无法创建 {_format_server_label(server)} 账户。", reply_markup=home_keyboard())
-             return
+        can_create, reason = _subscription_access_status(xboard_user)
+        if not can_create:
+            await query.edit_message_text(reason, reply_markup=home_keyboard())
+            return
 
         # 生成自定义用户名: jichang_ + 随机字符串
         custom_username = f"jichang_{generate_random_string(8)}"
@@ -1743,9 +2036,10 @@ def setup_bot(token):
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("admin", admin_command))
+    application.add_handler(CallbackQueryHandler(process_unbind_confirmation, pattern='^confirm_unbind_(yes|no)$'))
     
     # 5. 通用按钮处理器
-    # 注意：这个处理器不应处理 'reset_password' 和 'delete_account'，因为它们现在由自己的 ConversationHandler 处理
+    # 注意：这个处理器不应处理 'reset_password'、'delete_account' 和确认类回调，因为它们由专用处理器处理。
     application.add_handler(CallbackQueryHandler(button))
 
     return application
