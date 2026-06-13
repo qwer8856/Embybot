@@ -348,6 +348,24 @@ def delete_stored_emby_password(email, server_key=None):
         _save_password_store(store)
 
 
+def delete_stored_emby_passwords_for_identity(email=None, telegram_id=None):
+    """删除某个邮箱或 Telegram ID 在本地保存的 Emby 账号记录。"""
+    with _PASSWORD_STORE_LOCK:
+        store = _load_password_store()
+        removed = 0
+
+        for stored_email, stored_data in list(store.items()):
+            record = _coerce_password_record(stored_data)
+            if stored_email == email or (telegram_id is not None and record.get('telegram_id') == telegram_id):
+                store.pop(stored_email, None)
+                removed += 1
+
+        if removed:
+            _save_password_store(store)
+
+        return removed
+
+
 def get_stored_emby_account_entries(email, telegram_id=None, password_store=None):
     """返回某个 Xboard 邮箱可能关联的 Emby 账号记录，不访问 Emby API。"""
     password_store = password_store if isinstance(password_store, dict) else _load_password_store()
@@ -496,6 +514,70 @@ def delete_all_bot_managed_emby_users():
             result['failures'].append(f"{entry['emby_username']}@{server['display_name']}: 删除失败")
 
     result['removed_records'] = _remove_bot_managed_entries_from_store(removable_entries)
+    return result
+
+
+def delete_user_emby_accounts_for_unbind(email, telegram_id):
+    """删除用户解绑时关联的所有真实存在的 Emby 账号。"""
+    result = {
+        'planned': 0,
+        'deleted': 0,
+        'failed': 0,
+        'failures': [],
+    }
+    entries = get_stored_emby_account_entries(email, telegram_id)
+    emby_users_cache = {}
+    seen = set()
+
+    def get_user_map(server):
+        server_key = server['key']
+        if server_key not in emby_users_cache:
+            users = get_emby_users(server_key)
+            if not isinstance(users, list):
+                emby_users_cache[server_key] = None
+                result['failed'] += 1
+                result['failures'].append(f"{server['display_name']}: 无法获取用户列表")
+                return None
+
+            emby_users_cache[server_key] = {
+                user.get('Name', '').lower(): user
+                for user in users
+                if isinstance(user, dict) and user.get('Name')
+            }
+
+        return emby_users_cache[server_key]
+
+    for entry in entries:
+        server = get_emby_server(entry['server_key'])
+        if not server:
+            result['failed'] += 1
+            result['failures'].append(f"{entry['emby_username']}@{entry['server_key']}: 未找到服务器配置")
+            continue
+
+        user_map = get_user_map(server)
+        if user_map is None:
+            continue
+
+        emby_username = entry['emby_username']
+        emby_user = user_map.get(emby_username.strip().lower())
+        if not emby_user:
+            continue
+
+        unique_key = (server['key'], emby_user.get('Id') or emby_username.strip().lower())
+        if unique_key in seen:
+            continue
+        seen.add(unique_key)
+
+        result['planned'] += 1
+        label = f"{emby_username}@{server['display_name']}"
+
+        if delete_emby_user(emby_user['Id'], server['key']):
+            result['deleted'] += 1
+            delete_stored_emby_password(entry['source_email'], server['key'])
+        else:
+            result['failed'] += 1
+            result['failures'].append(label)
+
     return result
 
 
@@ -791,13 +873,30 @@ async def unbind_command(update: Update, context: CallbackContext) -> None:
         await update.message.reply_text(f"您的 Telegram 账户尚未绑定任何 {XBOARD_DISPLAY_NAME} 账户。")
         return
 
+    email = xboard_user.get('email')
+    delete_result = await run_blocking(delete_user_emby_accounts_for_unbind, email, user_id)
+    if delete_result['failed']:
+        failures = "\n".join(f"- {item}" for item in delete_result['failures'][:10])
+        await update.message.reply_text(
+            f"解绑前删除 {EMBY_DISPLAY_NAME} 账号失败，已取消解绑。\n\n"
+            f"删除成功: {delete_result['deleted']} 个\n"
+            f"删除失败: {delete_result['failed']} 个\n"
+            f"{failures}\n\n"
+            "请联系管理员处理后再重试。"
+        )
+        return
+
     if await run_blocking(unbind_telegram_id, user_id):
-        email = xboard_user.get('email')
-        if email:
-            await run_blocking(delete_stored_emby_password, email)
-        await update.message.reply_text(f"解绑成功！您的 Telegram 账户不再关联任何 {XBOARD_DISPLAY_NAME} 账户。\n如需再次使用，请 /bind。")
+        await run_blocking(delete_stored_emby_passwords_for_identity, email, user_id)
+        await update.message.reply_text(
+            f"解绑成功！您的 Telegram 账户不再关联任何 {XBOARD_DISPLAY_NAME} 账户。\n"
+            f"已同步删除 {delete_result['deleted']} 个 {EMBY_DISPLAY_NAME} 账号。\n"
+            "如需再次使用，请 /bind。"
+        )
     else:
-        await update.message.reply_text("解绑失败，请联系管理员。")
+        await update.message.reply_text(
+            f"解绑失败，请联系管理员。已删除 {delete_result['deleted']} 个 {EMBY_DISPLAY_NAME} 账号。"
+        )
 
 
 async def status_command(update: Update, context: CallbackContext) -> None:
@@ -1375,13 +1474,22 @@ async def button(update: Update, context: CallbackContext) -> None:
             )
             return
 
+        email = xboard_user.get('email', 'N/A')
+        emby_accounts = await run_blocking(resolve_emby_accounts, email, user_id)
+        if not emby_accounts:
+            await query.edit_message_text(
+                f"您还没有创建 {EMBY_DISPLAY_NAME} 账户。\n请先点击 \"开通 {EMBY_DISPLAY_NAME}\" 创建账户。",
+                reply_markup=home_keyboard()
+            )
+            return
+
         server_blocks = [
             (
                 f"<b>{index}. {_format_server_label(server)}</b>\n"
                 f"<b>服务器地址:</b> <code>{server['public_url']}</code>\n"
                 f"<b>服务器端口:</b> <code>{server['port']}</code>"
             )
-            for index, server in enumerate(_get_available_emby_servers(), start=1)
+            for index, server in enumerate((account['server'] for account in emby_accounts), start=1)
         ]
         message = (
             f"<b>🌐 {EMBY_DISPLAY_NAME} 服务器信息</b>\n\n"
