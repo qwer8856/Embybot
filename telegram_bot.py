@@ -278,6 +278,57 @@ def _format_server_label(server):
 def _escape_html(value):
     return html.escape(str(value), quote=False)
 
+def _format_number(value, digits=2):
+    try:
+        return f"{float(value):.{digits}f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+def _to_float(value, default=0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+def _format_subscription_progress(used_gb, total_gb, width=12):
+    used = _to_float(used_gb)
+    total = _to_float(total_gb)
+
+    if total <= 0:
+        return ""
+
+    ratio = min(max(used / total, 0), 1)
+    filled = round(ratio * width)
+    bar = "■" * filled + "□" * (width - filled)
+    return f"<code>{bar}</code> {_format_number(ratio * 100, 1)}%"
+
+def _format_subscription_message(details):
+    used_gb = _to_float(details.get('uploaded_gb')) + _to_float(details.get('downloaded_gb'))
+    total_gb = _to_float(details.get('total_gb'))
+    progress = _format_subscription_progress(used_gb, total_gb)
+
+    usage_lines = [
+        f"<b>已用流量</b>  {_format_number(used_gb)} GB",
+        f"<b>总流量</b>    {_format_number(total_gb)} GB",
+    ]
+    if progress:
+        usage_lines.append(progress)
+
+    return (
+        "<b>我的订阅</b>\n"
+        "━━━━━━━━━━━━\n\n"
+        "<b>套餐信息</b>\n"
+        f"套餐        {_escape_html(details.get('plan_name', 'N/A'))}\n"
+        f"到期时间    {_escape_html(details.get('expired_at', 'N/A'))}\n"
+        f"账户余额    ¥{_escape_html(details.get('balance', 0))}\n\n"
+        "<b>流量使用</b>\n"
+        + "\n".join(usage_lines)
+        + "\n\n"
+        "<b>订阅链接</b>\n"
+        f"<code>{_escape_html(details.get('subscription_url', ''))}</code>\n\n"
+        "<i>点击链接可直接复制</i>"
+    )
+
 def _format_account_message(title, account, include_password=True):
     server = account['server']
     message = (
@@ -1508,17 +1559,12 @@ async def button(update: Update, context: CallbackContext) -> None:
         if not details:
             await query.edit_message_text("未找到您的有效订阅。", reply_markup=home_keyboard())
             return
-        
-        message = (
-            f"<b>您的订阅详情:</b>\n\n"
-            f"<b>套餐:</b> {details['plan_name']}\n"
-            f"<b>到期时间:</b> {details['expired_at']}\n"
-            f"<b>已用流量:</b> {details['uploaded_gb'] + details['downloaded_gb']:.2f} GB\n"
-            f"<b>总流量:</b> {details['total_gb']} GB\n"
-            f"<b>余额:</b> ¥{details['balance']}\n\n"
-            f"<b>订阅链接</b> (点击即可复制):\n<code>{details['subscription_url']}</code>"
+
+        await query.edit_message_text(
+            text=_format_subscription_message(details),
+            parse_mode='HTML',
+            reply_markup=home_keyboard()
         )
-        await query.edit_message_text(text=message, parse_mode='HTML', reply_markup=home_keyboard())
 
     elif query.data == 'bind_emby':
         xboard_user = await run_blocking(get_user_by_telegram_id, user_id)
